@@ -614,6 +614,15 @@ static void drm_fb_helper_add_damage_clip(struct drm_fb_helper *helper, u32 x, u
 static void drm_fb_helper_damage(struct drm_fb_helper *helper, u32 x, u32 y,
 				 u32 width, u32 height)
 {
+#ifdef __FreeBSD__
+	/* oops_in_progress is SCHEDULER_STOPPED(), set in both cases. */
+	if (kdb_active || KERNEL_PANICKED()) {
+		drm_fb_helper_add_damage_clip(helper, x, y, width, height);
+		drm_fb_helper_damage_work(&helper->damage_work);
+		return;
+	}
+#endif
+
 	/*
 	 * This function may be invoked by panic() to flush the frame
 	 * buffer, where all CPUs except the panic CPU are stopped.
@@ -626,13 +635,6 @@ static void drm_fb_helper_damage(struct drm_fb_helper *helper, u32 x, u32 y,
 		return;
 
 	drm_fb_helper_add_damage_clip(helper, x, y, width, height);
-
-#ifdef __FreeBSD__
-	if (kdb_active || KERNEL_PANICKED()) {
-		drm_fb_helper_damage_work(&helper->damage_work);
-		return;
-	}
-#endif
 
 	schedule_work(&helper->damage_work);
 }

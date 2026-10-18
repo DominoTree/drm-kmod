@@ -164,6 +164,12 @@ static int drm_fbdev_ttm_helper_fb_dirty(struct drm_fb_helper *helper,
 	if (drm_WARN_ONCE(dev, ret, "Damage blitter failed: ret=%d\n", ret))
 		return ret;
 
+#ifdef __FreeBSD__
+	/* The blit is enough; dirty() commits atomic state. */
+	if (kdb_active || KERNEL_PANICKED())
+		return 0;
+#endif
+
 	if (helper->fb->funcs->dirty) {
 		ret = helper->fb->funcs->dirty(helper->fb, NULL, 0, 0, clip, 1);
 		if (drm_WARN_ONCE(dev, ret, "Dirty helper failed: ret=%d\n", ret))
