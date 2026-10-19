@@ -166,7 +166,7 @@ static int drm_fbdev_ttm_helper_fb_dirty(struct drm_fb_helper *helper,
 
 #ifdef __FreeBSD__
 	/* The blit is enough; dirty() commits atomic state. */
-	if (kdb_active || KERNEL_PANICKED())
+	if (KERNEL_PANICKED())
 		return 0;
 #endif
 

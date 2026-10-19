@@ -615,8 +615,11 @@ static void drm_fb_helper_damage(struct drm_fb_helper *helper, u32 x, u32 y,
 				 u32 width, u32 height)
 {
 #ifdef __FreeBSD__
-	/* oops_in_progress is SCHEDULER_STOPPED(), set in both cases. */
-	if (kdb_active || KERNEL_PANICKED()) {
+	/*
+	 * oops_in_progress is SCHEDULER_STOPPED(). Not under kdb: a damage
+	 * worker resumed by a ddb continue would find its mapping cleared.
+	 */
+	if (KERNEL_PANICKED()) {
 		drm_fb_helper_add_damage_clip(helper, x, y, width, height);
 		drm_fb_helper_damage_work(&helper->damage_work);
 		return;
