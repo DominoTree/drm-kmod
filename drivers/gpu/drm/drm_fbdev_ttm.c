@@ -111,6 +111,11 @@ static int drm_fbdev_ttm_damage_blit(struct drm_fb_helper *fb_helper,
 	struct iosys_map map, dst;
 	int ret;
 
+#ifdef __FreeBSD__
+	if (KERNEL_PANICKED() && drm_fb_helper_panic_blit(fb_helper, clip))
+		return 0;
+#endif
+
 	/*
 	 * We have to pin the client buffer to its current location while
 	 * flushing the shadow buffer. In the general case, concurrent

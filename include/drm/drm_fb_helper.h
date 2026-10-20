@@ -198,6 +198,14 @@ struct drm_fb_helper {
 	 */
 	int preferred_bpp;
 
+#ifdef __FreeBSD__
+	/* vt(4) panic console targets, see drm_fb_helper_debug_enter(). */
+	struct drm_fb_helper_panic_target *panic_targets;
+	unsigned int panic_max_targets;
+	unsigned int panic_num_targets;
+	int panic_state;
+#endif
+
 #ifdef CONFIG_FB_DEFERRED_IO
 	/**
 	 * @fbdefio:
@@ -258,6 +266,10 @@ void drm_fb_helper_fill_info(struct fb_info *info,
 
 void drm_fb_helper_damage_range(struct fb_info *info, off_t off, size_t len);
 void drm_fb_helper_damage_area(struct fb_info *info, u32 x, u32 y, u32 width, u32 height);
+#ifdef __FreeBSD__
+bool drm_fb_helper_panic_blit(struct drm_fb_helper *fb_helper,
+			      const struct drm_clip_rect *clip);
+#endif
 
 #ifdef CONFIG_FB_DEFERRED_IO
 void drm_fb_helper_deferred_io(struct fb_info *info, struct list_head *pagereflist);
