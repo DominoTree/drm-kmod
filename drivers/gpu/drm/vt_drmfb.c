@@ -318,6 +318,7 @@ vt_drmfb_invalidate_text(struct vt_device *vd, const term_rect_t *area)
 static int
 vt_drmfb_init_colors(struct fb_info *info)
 {
+	int error, i;
 
 	switch (FBTYPE_GET_BPP(info)) {
 	case 8:
@@ -330,9 +331,17 @@ vt_drmfb_init_colors(struct fb_info *info)
 		return (vt_config_cons_colors(info, COLOR_FORMAT_RGB,
 		    0x1f, 11, 0x3f, 5, 0x1f, 0));
 	case 24:
-	case 32: /* Ignore alpha. */
 		return (vt_config_cons_colors(info, COLOR_FORMAT_RGB,
 		    0xff, 16, 0xff, 8, 0xff, 0));
+	case 32:
+		error = vt_config_cons_colors(info, COLOR_FORMAT_RGB,
+		    0xff, 16, 0xff, 8, 0xff, 0);
+		if (error != 0)
+			return (error);
+		/* Opaque: the panic path copies into planes that blend. */
+		for (i = 0; i < nitems(info->fb_cmap); i++)
+			info->fb_cmap[i] |= 0xff000000;
+		return (0);
 	default:
 		return (1);
 	}
