@@ -45,6 +45,7 @@
 #include "drm_crtc_internal.h"
 
 #ifdef __FreeBSD__
+#include <drm/drm_panic.h>
 #define register_framebuffer linux_register_framebuffer
 #define unregister_framebuffer linux_unregister_framebuffer
 #endif
@@ -135,6 +136,186 @@ static void drm_fb_helper_restore_lut_atomic(struct drm_crtc *crtc)
 			       crtc->gamma_size, NULL);
 }
 
+#ifdef __FreeBSD__
+/*
+ * vt(4) panic console: once the kernel has panicked, copy the fbdev shadow
+ * into the buffers the display pipes already scan, through the driver's
+ * drm_panic hooks, and keep every later damage clip going there. Nothing
+ * is restored; the machine dumps and reboots. No locks, no TTM, no
+ * allocation in this path.
+ */
+struct drm_fb_helper_panic_target {
+	struct drm_plane *plane;
+	struct drm_scanout_buffer sb;
+};
+
+static bool drm_fb_helper_panic_applicable(struct drm_fb_helper *helper)
+{
+	struct drm_device *dev = helper->dev;
+	const struct drm_format_info *format;
+	struct drm_crtc *crtc;
+
+	if (!helper->panic_targets || !helper->fb || !helper->info)
+		return false;
+	if (!(helper->info->flags & FBINFO_VIRTFB))
+		return false;
+	if (!drm_drv_uses_atomic_modeset(dev))
+		return false;
+	format = helper->fb->format;
+	if (format->num_planes != 1 || format->cpp[0] != 4)
+		return false;
+	drm_for_each_crtc(crtc, dev) {
+		const struct drm_plane_helper_funcs *funcs;
+
+		if (!crtc->primary)
+			continue;
+		funcs = crtc->primary->helper_private;
+		if (funcs && funcs->get_scanout_buffer)
+			return true;
+	}
+	return false;
+}
+
+/* The clip is inside the shadow; crop it to the target. */
+static void drm_fb_helper_panic_copy(struct drm_fb_helper *helper,
+				     struct drm_fb_helper_panic_target *t,
+				     const struct drm_clip_rect *clip)
+{
+	struct drm_framebuffer *fb = helper->fb;
+	struct drm_scanout_buffer *sb = &t->sb;
+	struct iosys_map dst = sb->map[0];
+	const u8 *src;
+	unsigned int x1, y1, x2, y2, y;
+	size_t len;
+
+	x1 = clip->x1;
+	y1 = clip->y1;
+	x2 = min_t(unsigned int, clip->x2, sb->width);
+	y2 = min_t(unsigned int, clip->y2, sb->height);
+	if (x1 >= x2 || y1 >= y2)
+		return;
+	len = (size_t)(x2 - x1) * 4;
+	src = (const u8 *)helper->info->screen_buffer +
+	    (size_t)y1 * fb->pitches[0] + (size_t)x1 * 4;
+	iosys_map_incr(&dst, (size_t)y1 * sb->pitch[0] + (size_t)x1 * 4);
+	for (y = y1; y < y2; y++) {
+		iosys_map_memcpy_to(&dst, 0, src, len);
+		iosys_map_incr(&dst, sb->pitch[0]);
+		src += fb->pitches[0];
+	}
+}
+
+/* Black out the target area the shadow does not cover. */
+static void drm_fb_helper_panic_fill(struct drm_fb_helper *helper,
+				     struct drm_fb_helper_panic_target *t)
+{
+	struct drm_framebuffer *fb = helper->fb;
+	struct drm_scanout_buffer *sb = &t->sb;
+	struct iosys_map dst;
+	unsigned int y, rows;
+
+	if (sb->width > fb->width) {
+		dst = sb->map[0];
+		iosys_map_incr(&dst, (size_t)fb->width * 4);
+		rows = min(sb->height, fb->height);
+		for (y = 0; y < rows; y++) {
+			iosys_map_memset(&dst, 0, 0,
+			    (size_t)(sb->width - fb->width) * 4);
+			iosys_map_incr(&dst, sb->pitch[0]);
+		}
+	}
+	if (sb->height > fb->height) {
+		dst = sb->map[0];
+		iosys_map_incr(&dst, (size_t)fb->height * sb->pitch[0]);
+		iosys_map_memset(&dst, 0, 0,
+		    (size_t)(sb->height - fb->height) * sb->pitch[0]);
+	}
+}
+
+/*
+ * Returns whether the panic console owns this helper's damage, not whether
+ * pixels were written: a clip outside every target is a successful no-op.
+ */
+bool drm_fb_helper_panic_blit(struct drm_fb_helper *helper,
+			      const struct drm_clip_rect *clip)
+{
+	struct drm_clip_rect c;
+	unsigned int i;
+
+	if (helper->panic_state == 0)
+		return false;
+	if (helper->panic_num_targets == 0 || !helper->fb)
+		return true;
+	c.x1 = clip->x1;
+	c.y1 = clip->y1;
+	c.x2 = min_t(unsigned int, clip->x2, helper->fb->width);
+	c.y2 = min_t(unsigned int, clip->y2, helper->fb->height);
+	if (c.x1 >= c.x2 || c.y1 >= c.y2)
+		return true;
+	for (i = 0; i < helper->panic_num_targets; i++)
+		drm_fb_helper_panic_copy(helper, &helper->panic_targets[i], &c);
+	mb();
+	return true;
+}
+EXPORT_SYMBOL(drm_fb_helper_panic_blit);
+
+static void drm_fb_helper_panic_enter(struct drm_fb_helper *helper)
+{
+	struct drm_device *dev = helper->dev;
+	struct drm_clip_rect full;
+	struct drm_crtc *crtc;
+	unsigned long flags;
+
+	if (helper->panic_state != 0 || !drm_fb_helper_panic_applicable(helper))
+		return;
+	/* From here on this helper never falls back to TTM at panic. */
+	helper->panic_state = -1;
+	helper->panic_num_targets = 0;
+
+	if (!drm_panic_trylock(dev, flags))
+		return;
+	full.x1 = 0;
+	full.y1 = 0;
+	full.x2 = helper->fb->width;
+	full.y2 = helper->fb->height;
+	drm_for_each_crtc(crtc, dev) {
+		struct drm_plane *plane = crtc->primary;
+		const struct drm_plane_helper_funcs *funcs;
+		struct drm_fb_helper_panic_target *t;
+		struct drm_scanout_buffer *sb;
+
+		if (helper->panic_num_targets >= helper->panic_max_targets)
+			break;
+		if (!plane)
+			continue;
+		funcs = plane->helper_private;
+		if (!funcs || !funcs->get_scanout_buffer)
+			continue;
+		t = &helper->panic_targets[helper->panic_num_targets];
+		memset(t, 0, sizeof(*t));
+		sb = &t->sb;
+		if (funcs->get_scanout_buffer(plane, sb) != 0)
+			continue;
+		if (!sb->format || sb->format->num_planes != 1 ||
+		    sb->format->cpp[0] != 4 || sb->set_pixel ||
+		    iosys_map_is_null(&sb->map[0]) || !sb->width ||
+		    !sb->height || sb->pitch[0] < sb->width * 4)
+			continue;
+		t->plane = plane;
+		helper->panic_num_targets++;
+		helper->panic_state = 1;
+		drm_fb_helper_panic_fill(helper, t);
+		drm_fb_helper_panic_copy(helper, t, &full);
+		mb();
+		if (funcs->panic_flush)
+			funcs->panic_flush(plane);
+	}
+	drm_panic_unlock(dev, flags);
+	drm_info(dev, "panic console on %u scanout buffer(s)\n",
+	    helper->panic_num_targets);
+}
+#endif
+
 /**
  * drm_fb_helper_debug_enter - implementation for &fb_ops.fb_debug_enter
  * @info: fbdev registered by the helper
@@ -144,6 +325,11 @@ int drm_fb_helper_debug_enter(struct fb_info *info)
 	struct drm_fb_helper *helper = info->par;
 	const struct drm_crtc_helper_funcs *funcs;
 	struct drm_mode_set *mode_set;
+
+#ifdef __FreeBSD__
+	if (KERNEL_PANICKED())
+		drm_fb_helper_panic_enter(helper);
+#endif
 
 	list_for_each_entry(helper, &kernel_fb_helper_list, kernel_fb_list) {
 		mutex_lock(&helper->client.modeset_mutex);
@@ -445,6 +631,19 @@ void drm_fb_helper_prepare(struct drm_device *dev, struct drm_fb_helper *helper,
 	helper->funcs = funcs;
 	helper->dev = dev;
 	helper->preferred_bpp = preferred_bpp;
+#ifdef __FreeBSD__
+	helper->panic_state = 0;
+	helper->panic_num_targets = 0;
+	helper->panic_max_targets = dev->mode_config.num_crtc;
+	helper->panic_targets = NULL;
+	if (helper->panic_max_targets)
+		helper->panic_targets = kcalloc(helper->panic_max_targets,
+		    sizeof(*helper->panic_targets), GFP_KERNEL);
+	if (!helper->panic_targets) {
+		helper->panic_max_targets = 0;
+		drm_warn(dev, "no panic console targets\n");
+	}
+#endif
 }
 EXPORT_SYMBOL(drm_fb_helper_prepare);
 
@@ -456,6 +655,11 @@ EXPORT_SYMBOL(drm_fb_helper_prepare);
  */
 void drm_fb_helper_unprepare(struct drm_fb_helper *fb_helper)
 {
+#ifdef __FreeBSD__
+	kfree(fb_helper->panic_targets);
+	fb_helper->panic_targets = NULL;
+	fb_helper->panic_max_targets = 0;
+#endif
 	mutex_destroy(&fb_helper->lock);
 }
 EXPORT_SYMBOL(drm_fb_helper_unprepare);
