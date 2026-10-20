@@ -37,6 +37,9 @@
 #include "amdgpu_display.h"
 #include "amdgpu_dm_trace.h"
 #include "amdgpu_dm_plane.h"
+#ifdef __FreeBSD__
+#include "dc_dmub_srv.h"
+#endif
 #include "gc/gc_11_0_0_offset.h"
 #include "gc/gc_11_0_0_sh_mask.h"
 
@@ -1424,6 +1427,7 @@ static void amdgpu_dm_plane_atomic_async_update(struct drm_plane *plane,
 	amdgpu_dm_plane_handle_cursor_update(plane, old_state);
 }
 
+#ifdef __linux__
 static void amdgpu_dm_plane_panic_flush(struct drm_plane *plane)
 {
 	struct dm_plane_state *dm_plane_state = to_dm_plane_state(plane->state);
@@ -1437,6 +1441,232 @@ static void amdgpu_dm_plane_panic_flush(struct drm_plane *plane)
 
 	dc_plane_force_update_for_panic(dc_plane_state, fb->modifier ? true : false);
 }
+#elif defined(__FreeBSD__)
+/*
+ * vt(4) panic console. Panic context: every other CPU is stopped, no
+ * locks, no allocation. The buffer is taken from DC's state, not from the
+ * DRM framebuffer: between the atomic swap and the commit tail the DRM
+ * state names the next buffer while DC and the HUBP still scan the
+ * previous one.
+ */
+static int amdgpu_dm_plane_panic_gate(struct amdgpu_device *adev)
+{
+	struct dc *dc = adev->dm.dc;
+
+	if (adev->in_suspend || adev->in_s3 || adev->in_s4 || adev->shutdown ||
+	    adev->no_hw_access || amdgpu_in_reset(adev))
+		return -EBUSY;
+	if (!dc || !dc->current_state || !dc->res_pool || !dc->ctx)
+		return -ENODEV;
+	if (dc->caps.ips_support)
+		return -ENODEV;
+	if (dc->ctx->dmub_srv &&
+	    dc->ctx->dmub_srv->reg_helper_offload.gather_in_progress)
+		return -EBUSY;
+	if (!adev->mman.aper_base_kaddr)
+		return -ENODEV;
+	return 0;
+}
+
+/* The DC plane state the hardware scans for this primary plane. */
+static struct dc_plane_state *
+amdgpu_dm_plane_panic_plane_state(struct drm_plane *plane, int *error)
+{
+	struct amdgpu_device *adev = drm_to_adev(plane->dev);
+	struct dc *dc = adev->dm.dc;
+	struct dc_stream_state *candidates[2];
+	struct dc_stream_status *status = NULL;
+	struct dc_plane_state *ps = NULL, *dc_state = NULL;
+	struct drm_crtc *crtc, *found = NULL;
+	struct amdgpu_crtc *acrtc;
+	int i, zpos = -1, matches = 0;
+
+	/* Not plane->state->crtc: an unbind in flight already cleared it. */
+	drm_for_each_crtc(crtc, plane->dev) {
+		if (crtc->primary == plane) {
+			found = crtc;
+			break;
+		}
+	}
+	if (!found) {
+		*error = -ENOENT;
+		return NULL;
+	}
+	acrtc = to_amdgpu_crtc(found);
+	candidates[0] = found->state ?
+	    to_dm_crtc_state(found->state)->stream : NULL;
+	/* May dangle after a release; compared, never dereferenced. */
+	candidates[1] = acrtc->dm_irq_params.stream;
+	for (i = 0; i < ARRAY_SIZE(candidates) && !status; i++) {
+		if (candidates[i])
+			status = dc_state_get_stream_status(dc->current_state,
+			    candidates[i]);
+	}
+	if (!status) {
+		*error = -ENOENT;
+		return NULL;
+	}
+
+	if (plane->state) {
+		dc_state = to_dm_plane_state(plane->state)->dc_state;
+		zpos = plane->state->normalized_zpos;
+	}
+	for (i = 0; i < status->plane_count; i++) {
+		struct dc_plane_state *p = status->plane_states[i];
+
+		if (!p || p->is_phantom)
+			continue;
+		if (dc_state && p == dc_state) {
+			ps = p;
+			matches = 1;
+			break;
+		}
+		if (p->layer_index == zpos) {
+			ps = p;
+			matches++;
+		}
+	}
+	if (!ps || matches != 1) {
+		*error = -ENOENT;
+		return NULL;
+	}
+
+	/*
+	 * Only a completed update describes one allocation: the address is
+	 * copied into the plane state before its pitch, and the HUBP records
+	 * the address after programming it.
+	 */
+	matches = 0;
+	for (i = 0; i < dc->res_pool->pipe_count; i++) {
+		struct pipe_ctx *pipe = &dc->current_state->res_ctx.pipe_ctx[i];
+		struct hubp *hubp = pipe->plane_res.hubp;
+
+		if (pipe->plane_state != ps)
+			continue;
+		if (!hubp || hubp->power_gated ||
+		    hubp->request_address.grph.addr.quad_part !=
+		    ps->address.grph.addr.quad_part) {
+			*error = -EBUSY;
+			return NULL;
+		}
+		matches++;
+	}
+	if (!matches) {
+		*error = -ENOENT;
+		return NULL;
+	}
+	*error = 0;
+	return ps;
+}
+
+/*
+ * End of the VRAM BO behind plane->state->fb when it contains addr, else 0.
+ * A geometry-only update keeps the address, so a torn plane_size can only
+ * belong to this BO; pointer reads only.
+ */
+static u64 amdgpu_dm_plane_panic_bo_end(struct drm_plane *plane, u64 addr)
+{
+	struct amdgpu_device *adev = drm_to_adev(plane->dev);
+	struct drm_framebuffer *fb = plane->state ? plane->state->fb : NULL;
+	struct ttm_resource *res;
+	struct amdgpu_bo *bo;
+	u64 start, end;
+
+	if (!fb || !fb->obj[0])
+		return 0;
+	bo = gem_to_amdgpu_bo(fb->obj[0]);
+	res = bo->tbo.resource;
+	if (!res || res->mem_type != TTM_PL_VRAM ||
+	    res->start == AMDGPU_BO_INVALID_OFFSET)
+		return 0;
+	start = adev->gmc.vram_start + ((u64)res->start << PAGE_SHIFT);
+	end = start + bo->tbo.base.size;
+	if (addr < start || addr >= end)
+		return 0;
+	return end;
+}
+
+static int amdgpu_dm_plane_get_scanout_buffer(struct drm_plane *plane,
+					      struct drm_scanout_buffer *sb)
+{
+	struct amdgpu_device *adev = drm_to_adev(plane->dev);
+	struct dc_plane_state *ps;
+	u64 addr, off, pitch, size, bo_end;
+	int error;
+
+	error = amdgpu_dm_plane_panic_gate(adev);
+	if (error)
+		return error;
+	ps = amdgpu_dm_plane_panic_plane_state(plane, &error);
+	if (!ps)
+		return error;
+	/* Linear scanout with vertical source scan is unsupported. */
+	if (ps->address.type != PLN_ADDR_TYPE_GRAPHICS ||
+	    ps->format != SURFACE_PIXEL_FORMAT_GRPH_ARGB8888 ||
+	    ps->rotation == ROTATION_ANGLE_90 ||
+	    ps->rotation == ROTATION_ANGLE_270)
+		return -EOPNOTSUPP;
+	if (ps->plane_size.surface_pitch <= 0 ||
+	    ps->plane_size.surface_size.width <= 0 ||
+	    ps->plane_size.surface_size.height <= 0 ||
+	    ps->plane_size.surface_size.width > ps->plane_size.surface_pitch)
+		return -EINVAL;
+	pitch = (u64)ps->plane_size.surface_pitch * 4;
+	size = pitch * (u64)ps->plane_size.surface_size.height;
+	addr = (u64)ps->address.grph.addr.quad_part;
+	if (addr < adev->gmc.vram_start)
+		return -ERANGE;
+	off = addr - adev->gmc.vram_start;
+	if (off >= adev->gmc.visible_vram_size ||
+	    size > adev->gmc.visible_vram_size - off)
+		return -ERANGE;
+	bo_end = amdgpu_dm_plane_panic_bo_end(plane, addr);
+	if (bo_end != 0 && size > bo_end - addr) {
+		size = bo_end - addr;
+		if (size < pitch)
+			return -ERANGE;
+	}
+
+	sb->width = ps->plane_size.surface_size.width;
+	sb->height = size / pitch;
+	sb->pitch[0] = pitch;
+	sb->format = drm_format_info(DRM_FORMAT_XRGB8888);
+	iosys_map_set_vaddr_iomem(&sb->map[0],
+	    (u8 __iomem *)adev->mman.aper_base_kaddr + off);
+	if (KERNEL_PANICKED())
+		drm_info(plane->dev,
+		    "panic console: plane %u dc_plane %p addr 0x%llx off 0x%llx %ux%u pitch %llu bo_end 0x%llx swizzle %u dcc %u rot %u dc_lock %d\n",
+		    plane->base.id, ps, (unsigned long long)addr,
+		    (unsigned long long)off, sb->width, sb->height,
+		    (unsigned long long)pitch, (unsigned long long)bo_end,
+		    ps->tiling_info.gfx9.swizzle, ps->dcc.enable, ps->rotation,
+		    mutex_is_locked(&adev->dm.dc_lock));
+	return 0;
+}
+
+static void amdgpu_dm_plane_panic_flush(struct drm_plane *plane)
+{
+	struct amdgpu_device *adev = drm_to_adev(plane->dev);
+	struct dc *dc = adev->dm.dc;
+	struct dc_plane_state *ps;
+	int error;
+
+	if (amdgpu_dm_plane_panic_gate(adev))
+		return;
+	ps = amdgpu_dm_plane_panic_plane_state(plane, &error);
+	if (!ps)
+		return;
+	amdgpu_device_flush_hdp(adev, NULL);
+	if (dc->idle_optimizations_allowed) {
+		dc_allow_idle_optimizations(dc, false);
+		if (dc->idle_optimizations_allowed)
+			drm_info(plane->dev,
+			    "panic console: MALL still allowed, output may stay stale\n");
+	}
+	/* Always linear and DCC off: the state upstream relies on when tiled. */
+	dc_plane_force_update_for_panic(ps, true);
+}
+#endif
 
 static const struct drm_plane_helper_funcs dm_plane_helper_funcs = {
 	.prepare_fb = amdgpu_dm_plane_helper_prepare_fb,
@@ -1452,7 +1682,11 @@ static const struct drm_plane_helper_funcs dm_primary_plane_helper_funcs = {
 	.atomic_check = amdgpu_dm_plane_atomic_check,
 	.atomic_async_check = amdgpu_dm_plane_atomic_async_check,
 	.atomic_async_update = amdgpu_dm_plane_atomic_async_update,
+#ifdef __FreeBSD__
+	.get_scanout_buffer = amdgpu_dm_plane_get_scanout_buffer,
+#else
 	.get_scanout_buffer = amdgpu_display_get_scanout_buffer,
+#endif
 	.panic_flush = amdgpu_dm_plane_panic_flush,
 };
 
