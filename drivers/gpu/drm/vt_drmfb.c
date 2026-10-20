@@ -270,6 +270,14 @@ vt_drmfb_postswitch(struct vt_device *vd)
 		    taskqueue_member(taskqueue_thread, curthread) == 0)
 			taskqueue_drain(taskqueue_thread, &info->fb_mode_task);
 	} else {
+		if (vd->vd_grabwindow != NULL) {
+			if (info->fbops->fb_debug_enter)
+				info->fbops->fb_debug_enter(info);
+		} else {
+			if (info->fbops->fb_debug_leave)
+				info->fbops->fb_debug_leave(info);
+		}
+
 #ifdef DDB
 		db_trace_self_depth(10);
 		mdelay(1000);
@@ -278,14 +286,6 @@ vt_drmfb_postswitch(struct vt_device *vd)
 			spinlock_enter();
 			doadump(false);
 			EVENTHANDLER_INVOKE(shutdown_final, RB_NOSYNC);
-		}
-
-		if (vd->vd_grabwindow != NULL) {
-			if (info->fbops->fb_debug_enter)
-				info->fbops->fb_debug_enter(info);
-		} else {
-			if (info->fbops->fb_debug_leave)
-				info->fbops->fb_debug_leave(info);
 		}
 	}
 }
