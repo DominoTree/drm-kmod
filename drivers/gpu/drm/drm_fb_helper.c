@@ -601,7 +601,13 @@ static void drm_fb_helper_add_damage_clip(struct drm_fb_helper *helper, u32 x, u
 					  u32 width, u32 height)
 {
 	struct drm_clip_rect *clip = &helper->damage_clip;
+	struct drm_framebuffer *fb = helper->fb;
 	unsigned long flags;
+
+	x = min_t(u32, x, fb->width);
+	y = min_t(u32, y, fb->height);
+	width = min_t(u32, width, fb->width - x);
+	height = min_t(u32, height, fb->height - y);
 
 	spin_lock_irqsave(&helper->damage_lock, flags);
 	clip->x1 = min_t(u32, clip->x1, x);
