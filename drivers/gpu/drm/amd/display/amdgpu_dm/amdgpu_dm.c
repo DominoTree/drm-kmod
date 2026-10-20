@@ -9503,6 +9503,17 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
 				&acrtc_attach->dm_irq_params.vrr_params.adjust);
 			spin_unlock_irqrestore(&pcrtc->dev->event_lock, flags);
 		}
+#ifdef __FreeBSD__
+		{
+			/* Test only: the swap-to-tail window of the panic console. */
+			extern int amdgpu_dm_panic_in_flip;
+
+			if (amdgpu_dm_panic_in_flip && pflip_present) {
+				amdgpu_dm_panic_in_flip = 0;
+				panic("amdgpu panic console test: in flip");
+			}
+		}
+#endif
 		mutex_lock(&dm->dc_lock);
 		update_planes_and_stream_adapter(dm->dc,
 					 acrtc_state->update_type,

@@ -1666,6 +1666,61 @@ static void amdgpu_dm_plane_panic_flush(struct drm_plane *plane)
 	/* Always linear and DCC off: the state upstream relies on when tiled. */
 	dc_plane_force_update_for_panic(ps, true);
 }
+
+/* Test only, not for upstream: dry-run lookup and an in-flip panic. */
+#include <sys/sysctl.h>
+#include <drm/drm_drv.h>
+
+static struct amdgpu_device *amdgpu_dm_panic_probe_adev;
+int amdgpu_dm_panic_in_flip;
+SYSCTL_INT(_debug, OID_AUTO, amdgpu_panic_in_flip, CTLFLAG_RW,
+    &amdgpu_dm_panic_in_flip, 0,
+    "panic in the next page flip before the DC update (test)");
+
+static int
+amdgpu_dm_panic_probe_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct amdgpu_device *adev = amdgpu_dm_panic_probe_adev;
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_device *dev;
+	struct drm_plane *plane;
+	int error, ret, v = 0;
+
+	error = sysctl_handle_int(oidp, &v, 0, req);
+	if (error != 0 || req->newptr == NULL || v == 0)
+		return (error);
+	if (adev == NULL)
+		return (ENXIO);
+	dev = adev_to_drm(adev);
+	DRM_MODESET_LOCK_ALL_BEGIN(dev, ctx, 0, ret);
+	mutex_lock(&adev->dm.dc_lock);
+	drm_for_each_plane(plane, dev) {
+		struct drm_scanout_buffer sb = {};
+		struct drm_framebuffer *fb;
+		int r;
+
+		if (plane->type != DRM_PLANE_TYPE_PRIMARY)
+			continue;
+		fb = plane->state ? plane->state->fb : NULL;
+		r = amdgpu_dm_plane_get_scanout_buffer(plane, &sb);
+		drm_info(dev,
+		    "panic probe: plane %u crtc %u fb %ux%u pitch %u fourcc 0x%08x mod 0x%llx -> rc %d sb %ux%u pitch %u vaddr %p\n",
+		    plane->base.id,
+		    plane->state && plane->state->crtc ?
+		    plane->state->crtc->base.id : 0,
+		    fb ? fb->width : 0, fb ? fb->height : 0,
+		    fb ? fb->pitches[0] : 0, fb ? fb->format->format : 0,
+		    fb ? (unsigned long long)fb->modifier : 0ULL,
+		    r, sb.width, sb.height, sb.pitch[0], sb.map[0].vaddr_iomem);
+	}
+	mutex_unlock(&adev->dm.dc_lock);
+	DRM_MODESET_LOCK_ALL_END(dev, ctx, ret);
+	return (0);
+}
+SYSCTL_PROC(_debug, OID_AUTO, amdgpu_panic_probe,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, NULL, 0,
+    amdgpu_dm_panic_probe_sysctl, "I",
+    "dry-run the panic console scanout lookup (test)");
 #endif
 
 static const struct drm_plane_helper_funcs dm_plane_helper_funcs = {
@@ -2043,6 +2098,9 @@ int amdgpu_dm_plane_init(struct amdgpu_display_manager *dm,
 	uint64_t *modifiers = NULL;
 	unsigned int primary_zpos = dm->dc->caps.max_slave_planes;
 
+#ifdef __FreeBSD__
+	amdgpu_dm_panic_probe_adev = dm->adev;	/* test only */
+#endif
 	num_formats = amdgpu_dm_plane_get_plane_formats(plane, plane_cap, formats,
 							ARRAY_SIZE(formats));
 
