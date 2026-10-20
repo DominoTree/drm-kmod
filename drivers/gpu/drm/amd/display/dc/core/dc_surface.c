@@ -294,7 +294,7 @@ void dc_plane_force_update_for_panic(struct dc_plane_state *plane_state,
 	for (i = 0; i < dc->res_pool->pipe_count; i++) {
 		struct pipe_ctx *pipe_ctx = &dc->current_state->res_ctx.pipe_ctx[i];
 
-		if (!pipe_ctx)
+		if (pipe_ctx->plane_state != plane_state)
 			continue;
 
 		if (dc->ctx->dce_version >= DCE_VERSION_MAX) {
